@@ -1,208 +1,129 @@
-vis_AH_layout <- function(edgelist, 
-                          vInfo, 
-                          minSpacing = 0, 
-                          maxSpacing = 100, 
-                          key) { 
+vis_AH_layout <- function(edgelist, vInfo, key, spacing) {
   
   require(ggraph)
-  require(igraph)
-  require(scales)
   
-  internal_layout_horizontal <- function(edgelist, vInfo) {
+  vInfo <- vInfo %>% arrange(level, Node)
+  edgelist <- edgelist %>% arrange(layer)
   
-    # Add a central dummy vertex
-    tmp <- vInfo %>% filter(level == 1)
-    
-    if(nrow(tmp) > 1) {
-      
-      edgelist <- 
-        tibble(from = "dummyVertex", to = tmp$Node, layer = "dummyLayer", weight = 1) %>% 
-        rbind(edgelist)
-      
-    }
-    
-    igraph <- edgelist %>% edgelist_to_igraph(vInfo)
-    
-    # Vertex levels
-    if(nrow(tmp) > 1) { levels <- c(1, igraph::V(igraph)$level+1) } 
-    else { levels <- igraph::V(igraph)$level }
-    
-    # Determine horizontal version of layout based on sugiyama
-    layoutSug <- 
-      (igraph %>% 
-         igraph::layout_with_sugiyama(layers = levels))$layout
-    colnames(layoutSug) <- c("x", "y")
-    
-    layoutSug <- 
-      layoutSug %>%
-      as_tibble %>% 
-      mutate(level = y) %>%
-      select(level, x, y) %>%
-      split(., .$level)
-    
-    # Fix an error which can occur
-    if(nrow(layoutSug[[1]]) > 1) { 
-      
-      layoutSug <- rev(layoutSug)
-      
-      layoutSug <- 
-        
-        lapply(1:length(layoutSug), function(i) { 
-          
-          layoutSug[[i]] %>% mutate(level = i, y = i)
-          
-        })
-      
-    }
-    
-    layoutSug <- 
-      lapply(1:length(layoutSug), function(i) { 
-        
-        I = i-1
-        
-        layoutSug[[i]] %>%
-          mutate(x = scales::rescale(x, to = c(-I, I)),
-                 y = -y,
-                 pos = 1:n())
-        
-      }) %>% 
-      bind_rows() %>%
-      select(level, pos, x, y)
-    
-    # Remove dummy vertex
-    if(nrow(tmp) > 1) { 
-      layoutSug <- layoutSug %>% mutate(level = level-1, y = y+1) %>% filter(level != 0)
-    }
-    
-    return(layoutSug)
-    
-}
   
-  internal_layout_horizontalSpacing <- function(layoutHorizontal, 
-                                                minSpacing = 0.05, 
-                                                maxSpacing = 0.25) {
+  # DUMMY VERTEX ------------------------------------------------------------
+  VINFO <- vInfo %>% filter(level == min(level))
   
-    dl <- layoutHorizontal %>% split(., .$level)
+  EDGELIST <- edgelist %>% add_row(.before = 1, layer = "dummyLayer", from = "dummyVertex", to = VINFO$Node)
+  
+  VINFO <-
+    vInfo %>%
+    mutate(level = level + 1) %>%
+    add_row(.before = 1, level = 1, levelName = "dummyLevel", Node = "dummyVertex")
+  
+  IGRAPH <- EDGELIST %>% select(from, to, weight) %>% graph_from_data_frame(directed = FALSE)
+  
+  
+  # SUGIYAMA LAYOUT TEMPLATE ------------------------------------------------
+  LAYOUT <-
+    (IGRAPH %>%
+       layout_with_sugiyama(layers = VINFO$level))$layout %>%
+    as.data.frame %>%
+    setNames(c("x", "y")) %>%
+    slice(-1) %>%
+    cbind(vInfo, .) %>%
+    as_tibble() %>%
+    group_by(level, levelName) %>%
+    mutate(x = scales::rescale(x, to = c(-1,1)),
+           y = -level,
+           pos = 1:n()) %>%
+    ungroup %>%
+    arrange(level, x, y) %>%
+    split(.$level)
+  
+  
+  # VERTEX SPACING ----------------------------------------------------------
+  LAYOUT <- lapply(LAYOUT, function(i) {
     
-    for(j in 1:length(dl)) {
+    if(nrow(i) == 1) { dt <- i } else {
       
-      tmp <- dl[[j]] %>% arrange(x,y)
+      dt <- i
       
-      if(nrow(tmp) > 1) {
+      for(j in 1:(nrow(dt)-1)) {
         
+        diff = abs(dt$x[[j]] - dt$x[[j + 1]])
         
-        diffMin = minSpacing
-        diffMax = maxSpacing
-        
-        
-        for(i in 1:(nrow(tmp)-1)) {
-          
-          diff = abs(tmp$x[[i]] - tmp$x[[i + 1]])
-          diff
-          
-          if(diff < diffMin) { tmp$x[-(1:i)] <- tmp$x[-(1:i)] + (diffMin - diff) }
-          if(diff > diffMax) { tmp$x[-(1:i)] <- tmp$x[-(1:i)] - (diff - diffMax) }
-          
-        }
+        if(diff < spacing[[1]]) { dt$x[-(1:j)] <- dt$x[-(1:j)] + (spacing[[1]] - diff) }
+        if(diff > spacing[[2]]) { dt$x[-(1:j)] <- dt$x[-(1:j)] - (diff - spacing[[2]]) }
         
       }
       
-      dl[[j]] <- tmp
-      
     }
     
-    dl <- dl %>% bind_rows()
+    return(dt)
     
-    return(dl)
-    
-}
-
+  })
   
-  internal_layout_radial <- function(layoutHorizontal, edgelist, key) { 
+  
+  # RADIAL LAYOUT -----------------------------------------------------------
+  makeRadial <- function(dataInput, dataKey) {
     
-    internal_makeRadial <- 
-      function(data_internal, minAngle, maxAngle, radiusChange) { 
-        
-        # theta, angle in degrees
-        min = minAngle
-        max = maxAngle
-        
-        # theta, angle in radians
-        min = min * pi / 180
-        max = max * pi / 180
-        
-        # S = R0, arc length is equal to radius multiplied by theta
-        minS = min * data_internal$y[[1]]
-        maxS = max * data_internal$y[[1]]
-        
-        # (Optional) Adjustments to radius
-        R = radiusChange + data_internal$level[[1]]
-        
-        # Convert horizontal to radial
-        data_internal %>% 
-          mutate(x = scales::rescale(x, to = c(minS, maxS))) %>%
-          mutate(thetaRad2 = x/y, 
-                 x2 = R * cos(thetaRad2), 
-                 y2 = R * sin(thetaRad2)) 
-        
-      }
+    midPoint <- 270
     
-    dl <- layoutHorizontal %>% arrange(level, x) %>% split(., .$level)
+    # Convert angles to radian
+    min <- midPoint - dataKey$angle
+    min <- min * pi / 180
+    max <- dataKey$angle + midPoint
+    max <- max * pi / 180
     
-    dl <- 
-      
-      lapply(1:length(dl), function(i) { 
-        
-        internal_makeRadial(data_internal = dl[[i]], 
-                            minAngle = key$min[[i]], maxAngle = key$max[[i]], 
-                            radiusChange = key$addR[[i]])
-        
-      })
+    # S = R0, arc length is equal to radius multiplied by theta
+    minS <- min * dataInput$y[[1]]
+    maxS <- max * dataInput$y[[1]]
     
-    dl %>% 
-      bind_rows() %>% 
-      arrange(level, pos) %>%
-      select(level, pos, x = x2, y = y2, theta = thetaRad2) %>%
-      ggraph::create_layout(edgelist, layout = .)
+    # (Optional) Adjustments to radius
+    R <- dataKey$addR + dataInput$level[[1]]
+    
+    # Convert to polar coordinates
+    dataInput %>%
+      mutate(x = scales::rescale(x, to = c(minS, maxS))) %>%
+      mutate(thetaRad2 = x/y,
+             x2 = R * cos(thetaRad2),
+             y2 = R * sin(thetaRad2))
     
   }
   
+  LAYOUT_GG <- lapply(1:length(LAYOUT), function(x) { makeRadial(LAYOUT[[x]], key[x,]) }) %>% bind_rows()
   
-  internal_layout_generic <- function(layoutRadial) { 
-    
-    require(ggraph)
-    require(igraph)
-    
-    # Create edge function
-    findEdges <- ggraph::get_edges("short", collapse = "none")
-    
-    # Extract edge list with layout
-    edges <- 
-      findEdges(layoutRadial) %>% 
-      as_tibble %>% 
-      select(from.level = node1.level,  to.level = node2.level, layer, 
-             from = node1.name, to = node2.name, 
-             x = node1.x, y = node1.y, xend = node2.x, yend = node2.y) 
-    
-    # Create node function (vertices)
-    findNodes <- ggraph::get_nodes()
-    
-    # Extract vertex list with layout
-    vertices <- 
-      findNodes(layoutRadial) %>% 
-      as_tibble %>% 
-      select(level, Node = name, x, y, pos, theta)
-    
-    list(edges = edges, vertices = vertices)
-    
-  }
+  LAYOUT_GG <-
+    LAYOUT_GG %>%
+    select(-x, -y) %>%
+    rename(x = x2, y = y2, theta = thetaRad2) %>%
+    create_layout(edgelist, layout = .)
   
-  output <- 
-    internal_layout_horizontal(edgelist = edgelist, vInfo = vInfo) %>%
-    internal_layout_horizontalSpacing(., minSpacing = minSpacing, maxSpacing = maxSpacing) %>%
-    internal_layout_radial(layoutHorizontal = ., edgelist = edgelist, key = key) %>% 
-    internal_layout_generic(layoutRadial = .)
+  # EXTRACT -----------------------------------------------------------------
+  findEdges <- get_edges("short", collapse = "none")
   
+  edges <- findEdges(LAYOUT_GG) %>%
+    as_tibble()
+  
+  edges <- findEdges(LAYOUT_GG) %>%
+    as_tibble() %>%
+    select(fromLevel = node1.level, toLevel = node2.level,
+           from = node1.name, to = node2.name,
+           x = node1.x, y = node1.y, xend = node2.x, yend = node2.y) %>%
+    left_join(edgelist, by = c("from", "to")) %>%
+    mutate(layer = ifelse(is.na(layer), "dummyLayer", layer)) %>%
+    mutate(layer = factor(layer, levels = edgelist %>% pull(layer) %>% unique()))
+  
+  
+  findNodes <- get_nodes()
+  
+  vertices <-
+    findNodes(LAYOUT_GG) %>%
+    as_tibble %>%
+    select(level, levelName, Node = name, x, y, theta) 
+  
+  
+  # OUTPUT ------------------------------------------------------------------
+  vertices$Node <- gsub("'", '', vertices$Node)
+  edges$to <- gsub("'", '', edges$to)
+  
+  output <- list(edges = edges, vertices = vertices)
   return(output)
   
 }
